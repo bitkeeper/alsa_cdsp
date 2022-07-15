@@ -72,7 +72,7 @@
 //#ifdef CLOCK_MONOTONIC_RAW
 //# define gettimestamp(ts) clock_gettime(CLOCK_MONOTONIC_RAW, ts)
 //#else
-# define gettimestamp(ts) clock_gettime(CLOCK_MONOTONIC, ts)
+// # define gettimestamp(ts) clock_gettime(CLOCK_MONOTONIC, ts)
 //#endif
 
 
@@ -228,7 +228,7 @@ static void io_thread_cleanup(cdsp_t *pcm) {
 }
 
 // Helper function for IO thread delay calculation.
-static void io_thread_update_delay(cdsp_t *pcm, snd_pcm_uframes_t hw_ptr) {
+static void io_thread_update_delay(cdsp_t *pcm, snd_pcm_sframes_t hw_ptr) {
   struct timespec now;
   unsigned int nread = 0;
 
@@ -241,7 +241,7 @@ static void io_thread_update_delay(cdsp_t *pcm, snd_pcm_uframes_t hw_ptr) {
   // stash current time and levels
   pcm->delay_ts = now;
   pcm->delay_pcm_nread = nread;
-  // if (pcm->io_status < 0) {
+//  if (pcm->io_status < 0) {
   if (hw_ptr == -1) {
     pcm->delay_hw_ptr = 0;
     if (pcm->io.stream == SND_PCM_STREAM_PLAYBACK)
@@ -307,6 +307,7 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
       debug("IO thread resumed\n");
 
       if (pcm->io_hw_ptr == -1)
+      // if (pcm->io_status < 0)
         continue;
       if (pcm->cdsp_pcm_fd == -1) {
         error("FAILING BECAUSE PIPE GONE\n");
@@ -351,7 +352,8 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
           // The player isn't providing data fast enough.
           error("XRUN OCCURRED!\n");
           // Signal XRUN to the ioplug code
-	        pcm->io_hw_ptr = io_hw_ptr = -1;
+	        pcm->io_status = -1;
+          pcm->io_hw_ptr = io_hw_ptr = -1;
 			    io_thread_update_delay(pcm, io_hw_ptr);
 			    eventfd_write(pcm->event_fd, 1);
 
@@ -390,7 +392,7 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
 
     // Increment the HW pointer (with boundary wrap)
     io_hw_ptr += frames;
-    if (io_hw_ptr >= pcm->io_hw_boundary)
+    if ((snd_pcm_uframes_t)io_hw_ptr >= pcm->io_hw_boundary)
       io_hw_ptr -= pcm->io_hw_boundary;
 
     ssize_t ret = 0;
@@ -419,6 +421,7 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
     // past the end of the hardware buffer the app can't write past
     // it so the metric is distance from the end of the buffer.
     // offset = io_hw_ptr % io->buffer_size;
+    // if(io->buffer_size - offset >= pcm->io_avail_min) {
     if (frames + io->buffer_size - avail >= pcm->io_avail_min) {
       eventfd_write(pcm->event_fd, 1);
     }
@@ -779,7 +782,7 @@ static int cdsp_fix_hw_params(snd_pcm_ioplug_t *io, snd_pcm_hw_params_t *params)
 	if (buffer_size % period_size == 0)
 		return 0;
 
-	debug("Attempting to fix hw params buffer size");
+	debug("Attempting to fix hw params buffer size\n");
 
 	snd_pcm_hw_params_t *refined_params;
 
@@ -862,7 +865,9 @@ static int cdsp_hw_params(snd_pcm_ioplug_t *io, snd_pcm_hw_params_t *params __at
   info("FIFO buffer size: %ld frames\n", pcm->delay_fifo_size);
 
   /* ALSA default for avail min is one period. */
+  // pcm->io_avail_min = io->period_size;
   pcm->io_avail_min = period_size;
+  info("IO avail min: %ld frames\n", pcm->io_avail_min);
 
   info("Selected HW buffer: %ld periods x %ld bytes %c= %ld bytes\n",
       buffer_size / period_size, pcm->frame_size * period_size,
@@ -984,7 +989,7 @@ static snd_pcm_sframes_t cdsp_calculate_delay(snd_pcm_ioplug_t *io) {
 
   /* if PCM is not started there should be no capture delay */
   if (!pcm->delay_running && io->stream == SND_PCM_STREAM_CAPTURE)
-    return 0;
+     return 0;
 
   struct timespec now;
   gettimestamp(&now);
@@ -1044,6 +1049,7 @@ static int cdsp_pause(snd_pcm_ioplug_t *io, int enable) {
   if (enable == 1) {
     // Synchronize the IO thread with an application thread to ensure that
     // the server will not be paused while we are processing a transfer.
+    debug("Pause Sync ON\n");
     pthread_mutex_lock(&pcm->mutex);
     pcm->pause_state |= CDSP_PAUSE_STATE_PENDING;
     while (!(pcm->pause_state & CDSP_PAUSE_STATE_PAUSED)
@@ -1051,6 +1057,7 @@ static int cdsp_pause(snd_pcm_ioplug_t *io, int enable) {
       pthread_cond_wait(&pcm->pause_cond, &pcm->mutex);
     }
     pthread_mutex_unlock(&pcm->mutex);
+    debug("Pause Sync OFF\n");
   }
 
   if (enable == 0) {
