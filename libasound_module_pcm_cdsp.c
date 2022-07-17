@@ -25,7 +25,6 @@
 #include <assert.h>
 #include <stdint.h>
 #include <limits.h>
-#include <sys/time.h>
 
 #include <alsa/asoundlib.h>
 #include <alsa/pcm_external.h>
@@ -33,7 +32,7 @@
 #include "rt.h"
 #include "strrep.h"
 
-#define DEBUG 1
+#define DEBUG 4
 #define error(fmt, ...) \
   do { if(DEBUG > 0){fprintf(stderr,"CDSP Plugin ERROR: ");\
     fprintf(stderr,((fmt)), ##__VA_ARGS__);} } while (0)
@@ -58,22 +57,6 @@
 
 // Thread routing callback casting wrapper.
 #define PTHREAD_ROUTINE(f) ((void *(*)(void *))(f))
-
-//
-// Get system monotonic time-stamp.
-//
-// Why try for RAW?  We're trying to simulate an accurate clock.  Let
-// ntp correct the rate.
-//
-// @param ts Address to the timespec structure where the time-stamp will
-// be stored.
-// @return On success this function returns 0. Otherwise, -1 is returned
-// and errno is set to indicate the error.
-//#ifdef CLOCK_MONOTONIC_RAW
-//# define gettimestamp(ts) clock_gettime(CLOCK_MONOTONIC_RAW, ts)
-//#else
-// # define gettimestamp(ts) clock_gettime(CLOCK_MONOTONIC, ts)
-//#endif
 
 
 #if SND_LIB_VERSION >= 0x010104
@@ -241,8 +224,8 @@ static void io_thread_update_delay(cdsp_t *pcm, snd_pcm_sframes_t hw_ptr) {
   // stash current time and levels
   pcm->delay_ts = now;
   pcm->delay_pcm_nread = nread;
-//  if (pcm->io_status < 0) {
-  if (hw_ptr == -1) {
+  if (pcm->io_status < 0) {
+  // if (hw_ptr == -1) {
     pcm->delay_hw_ptr = 0;
     if (pcm->io.stream == SND_PCM_STREAM_PLAYBACK)
       pcm->delay_running = false;
@@ -289,7 +272,8 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
   debug("Starting IO loop: %d\n", pcm->cdsp_pcm_fd);
   for (;;) {
     if (pcm->pause_state & CDSP_PAUSE_STATE_PENDING ||
-        pcm->io_hw_ptr == -1) {
+        pcm->io_status < 0) {
+        // pcm->io_hw_ptr == -1) {
       debug("Pausing IO thread\n");
 
       pthread_mutex_lock(&pcm->mutex);
@@ -306,8 +290,8 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
 
       debug("IO thread resumed\n");
 
-      if (pcm->io_hw_ptr == -1)
-      // if (pcm->io_status < 0)
+      // if (pcm->io_hw_ptr == -1)
+      if (pcm->io_status < 0)
         continue;
       if (pcm->cdsp_pcm_fd == -1) {
         error("FAILING BECAUSE PIPE GONE\n");
@@ -356,10 +340,6 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
           pcm->io_hw_ptr = io_hw_ptr = -1;
 			    io_thread_update_delay(pcm, io_hw_ptr);
 			    eventfd_write(pcm->event_fd, 1);
-
-          // pcm->io_status = -1;
-          // io_thread_update_delay(pcm, 0);
-          // eventfd_write(pcm->event_fd, 1);
         }
         continue;
       }
@@ -1122,8 +1102,9 @@ static int cdsp_delay(snd_pcm_ioplug_t *io, snd_pcm_sframes_t *delayp) {
     case SND_PCM_STATE_SUSPENDED:
       ret = -ESTRPIPE;
       break;
-    // case SND_PCM_STATE_DISCONNECTED:
-    //   ret = -ENODEV;
+    case SND_PCM_STATE_DISCONNECTED:
+      snd_pcm_ioplug_set_state(io, SND_PCM_STATE_DISCONNECTED);
+      ret = -ENODEV;
       break;
     default:
       break;

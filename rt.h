@@ -57,7 +57,7 @@ struct asrsync {
 	/* time-stamp from the previous sync */
 	struct timespec ts;
 	/* transfered frames since ts0 */
-	uint32_t frames;
+	uint64_t frames;
 
 	/* time spent outside of the sync function */
 	struct timespec ts_busy;
@@ -66,6 +66,11 @@ struct asrsync {
 	 * contains an overdue time - synchronization was not possible due to
 	 * too much time spent outside of the sync function. */
 	struct timespec ts_idle;
+
+	/* indicates if running in sync mode or not
+	 * cdsp is started not in sync and after a period is switch in to sync mode.
+	 */
+	bool sync_mode;
 
 };
 
@@ -79,6 +84,7 @@ struct asrsync {
 		gettimestamp(&(asrs)->ts0); \
 		(asrs)->ts = (asrs)->ts0; \
 		(asrs)->frames = 0; \
+		(asrs)->sync_mode = false; \
 	} while (0)
 
 int asrsync_sync(struct asrsync *asrs, unsigned int frames);

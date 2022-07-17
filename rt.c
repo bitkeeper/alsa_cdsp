@@ -31,22 +31,55 @@ int asrsync_sync(struct asrsync *asrs, unsigned int frames) {
 
 	const unsigned int rate = asrs->rate;
 	struct timespec ts_rate;
-	struct timespec ts;
+	struct timespec ts_now;
+	struct timespec ts_running;
+	struct timespec* ts_rev = 0;
 	int rv = 0;
+	const uint64_t FRAME_THRESHOLD = 200000;
 
 	asrs->frames += frames;
-	frames = asrs->frames;
+
+	/* There is an issue when using asrs->ts0 and asrs->frames directly from the start.
+	 * This result is stutter after the start (on pause/play).
+	 * Not sure why,if the asrs>ts and frames is used, then the problem isn't there.
+	 * But that gives XRUNs on long term play > 3 hours.
+	 *
+	 * Workarround:
+	 * The asrs->sync_mode toggles between those more after FRAME_THRESHOLD after startup.
+	 */
+	if(!asrs->sync_mode) {
+		asrs->sync_mode = asrs->frames >= FRAME_THRESHOLD;
+		if(asrs->sync_mode) {
+			debug("Synced mode active\n");
+			asrs->frames = frames;
+			asrs->ts0 = asrs->ts;
+		}
+	}
+
+	if(asrs->sync_mode) {
+		frames = asrs->frames;
+		ts_rev = &asrs->ts0;
+	}else {
+		ts_rev = &asrs->ts;
+	}
 
 	ts_rate.tv_sec = frames / rate;
 	ts_rate.tv_nsec = 1000000000L / rate * (frames % rate);
 
-	gettimestamp(&ts);
+	gettimestamp(&ts_now);
 	/* calculate delay since the last sync */
-	timespecsub(&ts, &asrs->ts, &asrs->ts_busy);
+	timespecsub(&ts_now, &asrs->ts, &asrs->ts_busy);
 
 	/* maintain constant rate */
-	timespecsub(&ts, &asrs->ts0, &ts);
-	if (difftimespec(&ts, &ts_rate, &asrs->ts_idle) > 0) {
+	timespecsub(&ts_now, ts_rev, &ts_running);
+	if (difftimespec(&ts_running, &ts_rate, &asrs->ts_idle) > 0) {
+		if (!asrs->sync_mode) {
+			double idle_time = (double)asrs->ts_idle.tv_sec + (double)asrs->ts_idle.tv_nsec/1e9;
+			idle_time *= 0.5;
+			asrs->ts_idle.tv_sec = (time_t)idle_time;
+			asrs->ts_idle.tv_nsec = (long)(idle_time*1e9);
+		}
+
 		nanosleep(&asrs->ts_idle, NULL);
 		rv = 1;
 	}
