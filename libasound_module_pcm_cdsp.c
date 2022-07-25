@@ -29,9 +29,10 @@
 #include <alsa/asoundlib.h>
 #include <alsa/pcm_external.h>
 
+#include "rt.h"
 #include "strrep.h"
 
-#define DEBUG 1
+#define DEBUG 2
 #define error(fmt, ...) \
   do { if(DEBUG > 0){fprintf(stderr,"CDSP Plugin ERROR: ");\
     fprintf(stderr,((fmt)), ##__VA_ARGS__);} } while (0)
@@ -57,64 +58,20 @@
 // Thread routing callback casting wrapper.
 #define PTHREAD_ROUTINE(f) ((void *(*)(void *))(f))
 
-//
-// Get system monotonic time-stamp.
-//
-// Why try for RAW?  We're trying to simulate an accurate clock.  Let
-// ntp correct the rate.
-//
-// @param ts Address to the timespec structure where the time-stamp will
-// be stored.
-// @return On success this function returns 0. Otherwise, -1 is returned
-// and errno is set to indicate the error.
-//#ifdef CLOCK_MONOTONIC_RAW
-//# define gettimestamp(ts) clock_gettime(CLOCK_MONOTONIC_RAW, ts)
-//#else
-# define gettimestamp(ts) clock_gettime(CLOCK_MONOTONIC, ts)
-//#endif
 
-// Calculate time difference for two time points.
-// 
-//  @param ts1 Address to the timespec structure providing t1 time point.
-//  @param ts2 Address to the timespec structure providing t2 time point.
-//  @param ts Address to the timespec structure where the absolute time
-//    difference will be stored.
-// @return This function returns an integer less than, equal to, or greater
-//    than zero, if t2 time point is found to be, respectively, less than,
-//    equal to, or greater than the t1 time point.*/
-int difftimespec( const struct timespec *ts1, const struct timespec *ts2,
-    struct timespec *ts) {
-  const struct timespec _ts1 = *ts1;
-  const struct timespec _ts2 = *ts2;
+#if SND_LIB_VERSION >= 0x010104
+/**
+ * alsa-lib releases from 1.1.4 have a bug in the rate plugin
+ * which, when combined with the hw params refinement algorithm used by the
+ * ioplug, can cause snd_pcm_avail() to return bogus values. This, in turn,
+ * can trigger deadlock in applications built on the portaudio library
+ * (e.g. audacity) and possibly cause faults in other applications too.
+ *
+ * This macro enables a work-around for this bug.
+ * */
+# define CDSP_HW_PARAMS_FIX 1
+#endif
 
-  if (_ts1.tv_sec == _ts2.tv_sec) {
-    ts->tv_sec = 0;
-    ts->tv_nsec = labs(_ts2.tv_nsec - _ts1.tv_nsec);
-    return _ts2.tv_nsec > _ts1.tv_nsec ? 1 : -ts->tv_nsec;
-  }
-
-  if (_ts1.tv_sec < _ts2.tv_sec) {
-    if (_ts1.tv_nsec <= _ts2.tv_nsec) {
-      ts->tv_sec = _ts2.tv_sec - _ts1.tv_sec;
-      ts->tv_nsec = _ts2.tv_nsec - _ts1.tv_nsec;
-    }
-    else {
-      ts->tv_sec = _ts2.tv_sec - 1 - _ts1.tv_sec;
-      ts->tv_nsec = _ts2.tv_nsec + 1000000000 - _ts1.tv_nsec;
-    }
-    return 1;
-  }
-
-  if (_ts1.tv_nsec >= _ts2.tv_nsec) {
-    ts->tv_sec = _ts1.tv_sec - _ts2.tv_sec;
-    ts->tv_nsec = _ts1.tv_nsec - _ts2.tv_nsec;
-  }
-  else {
-    ts->tv_sec = _ts1.tv_sec - 1 - _ts2.tv_sec;
-    ts->tv_nsec = _ts1.tv_nsec + 1000000000 - _ts2.tv_nsec;
-  }
-  return -1;
-}
 
 typedef struct {
   snd_pcm_ioplug_t io;
@@ -135,7 +92,7 @@ typedef struct {
   // (pcm->io_hw_ptr), the application is responsible for the application
   // pointer (io->appl_ptr). These are both volatile as they are both
   // written in one thread and read in the other.
-  volatile snd_pcm_uframes_t io_hw_ptr;
+  volatile snd_pcm_sframes_t io_hw_ptr;
   // A signed value for the status return to the IO plugin pointer call
   volatile int io_status;
   snd_pcm_uframes_t io_hw_boundary;
@@ -220,7 +177,7 @@ typedef struct {
 // This function is available in alsa-lib since version 1.1.6. For older
 // alsa-lib versions we need to provide our own implementation.
 static snd_pcm_uframes_t snd_pcm_ioplug_hw_avail(
-    const snd_pcm_ioplug_t * const io, const snd_pcm_uframes_t hw_ptr, 
+    const snd_pcm_ioplug_t * const io, const snd_pcm_uframes_t hw_ptr,
     const snd_pcm_uframes_t appl_ptr) {
   cdsp_t *pcm = io->private_data;
   snd_pcm_sframes_t diff;
@@ -230,7 +187,8 @@ static snd_pcm_uframes_t snd_pcm_ioplug_hw_avail(
     diff = io->buffer_size - hw_ptr + appl_ptr;
   if (diff < 0)
     diff += pcm->io_hw_boundary;
-  return diff <= io->buffer_size ? (snd_pcm_uframes_t) diff : 0;
+  snd_pcm_uframes_t diff_ = diff;
+  return diff_ <= io->buffer_size ? diff_ : 0;
 }
 #endif
 
@@ -253,7 +211,7 @@ static void io_thread_cleanup(cdsp_t *pcm) {
 }
 
 // Helper function for IO thread delay calculation.
-static void io_thread_update_delay(cdsp_t *pcm, snd_pcm_uframes_t hw_ptr) {
+static void io_thread_update_delay(cdsp_t *pcm, snd_pcm_sframes_t hw_ptr) {
   struct timespec now;
   unsigned int nread = 0;
 
@@ -267,6 +225,7 @@ static void io_thread_update_delay(cdsp_t *pcm, snd_pcm_uframes_t hw_ptr) {
   pcm->delay_ts = now;
   pcm->delay_pcm_nread = nread;
   if (pcm->io_status < 0) {
+  // if (hw_ptr == -1) {
     pcm->delay_hw_ptr = 0;
     if (pcm->io.stream == SND_PCM_STREAM_PLAYBACK)
       pcm->delay_running = false;
@@ -302,15 +261,19 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
     goto fail;
   }
 
+  struct asrsync asrs;
+	asrsync_init(&asrs, io->rate);
+
   // We update pcm->io_hw_ptr (i.e. the value seen by ioplug) only when
   // a period has been completed. We use a temporary copy during the
   // transfer procedure.
-  snd_pcm_uframes_t io_hw_ptr = pcm->io_hw_ptr;
+  snd_pcm_sframes_t io_hw_ptr = pcm->io_hw_ptr;
 
   debug("Starting IO loop: %d\n", pcm->cdsp_pcm_fd);
   for (;;) {
     if (pcm->pause_state & CDSP_PAUSE_STATE_PENDING ||
         pcm->io_status < 0) {
+        // pcm->io_hw_ptr == -1) {
       debug("Pausing IO thread\n");
 
       pthread_mutex_lock(&pcm->mutex);
@@ -327,12 +290,16 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
 
       debug("IO thread resumed\n");
 
+      // if (pcm->io_hw_ptr == -1)
       if (pcm->io_status < 0)
         continue;
       if (pcm->cdsp_pcm_fd == -1) {
         error("FAILING BECAUSE PIPE GONE\n");
         goto fail;
       }
+
+      asrsync_init(&asrs, io->rate);
+      io_hw_ptr = pcm->io_hw_ptr;
     }
 
     // There are 2 reasons why the number of available frames may be
@@ -344,6 +311,7 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
         // Draining is complete.  Signal that to the ioplug code so it will
         // drop the pcm.
         pcm->io_status = -1;
+		// pcm->io_hw_ptr = io_hw_ptr = -1;
         io_thread_update_delay(pcm, 0);
         eventfd_write(pcm->event_fd, 1);
         continue;
@@ -355,7 +323,7 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
         // Sleep in 1/4 period intervals to wait for data to catch up
         // Add 1 extra sample to the period to allow for clock differences
         // and rounding errors
-        uint64_t quarter_period_ns = 
+        uint64_t quarter_period_ns =
           (1000000000 / 4) * (io->period_size+1) / io->rate;
         struct timespec ts;
         ts.tv_sec = quarter_period_ns / 1000000000;
@@ -368,9 +336,10 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
           // The player isn't providing data fast enough.
           error("XRUN OCCURRED!\n");
           // Signal XRUN to the ioplug code
-          pcm->io_status = -1;
-          io_thread_update_delay(pcm, 0);
-          eventfd_write(pcm->event_fd, 1);
+	        pcm->io_status = -1;
+          pcm->io_hw_ptr = io_hw_ptr = -1;
+			    io_thread_update_delay(pcm, io_hw_ptr);
+			    eventfd_write(pcm->event_fd, 1);
         }
         continue;
       }
@@ -391,7 +360,7 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
     }
 
     // Sometimes alsa chooses a buffer size that isn't an integer multiple
-    // of the period size.  In that case don't read past the end of the 
+    // of the period size.  In that case don't read past the end of the
     // buffer.
     if (io->buffer_size - offset < frames) {
       frames = io->buffer_size - offset;
@@ -403,13 +372,10 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
 
     // Increment the HW pointer (with boundary wrap)
     io_hw_ptr += frames;
-    if (io_hw_ptr >= pcm->io_hw_boundary)
+    if ((snd_pcm_uframes_t)io_hw_ptr >= pcm->io_hw_boundary)
       io_hw_ptr -= pcm->io_hw_boundary;
 
     ssize_t ret = 0;
-
-    struct timespec tstart,tstop,twrite;
-    gettimestamp(&tstart);
 
     // Perform atomic write - see the explanation above.
     do {
@@ -424,22 +390,8 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
       len -= ret;
     } while (len != 0);
     io_thread_update_delay(pcm, io_hw_ptr);
-    // Things tend to run a little smoother if writes take at least
-    // some time.  So slow down when the pipe was empty enough that the
-    // write was basically instant.
-    gettimestamp(&tstop);
-    difftimespec(&tstart, &tstop, &twrite);
-    double sampletime = (double)frames/(double)io->rate;
-    double writetime = (double)twrite.tv_sec + (double)twrite.tv_nsec/1e9;
-    double excess = sampletime - writetime;
-    if(excess > 0) {
-      excess *= 0.5;
-      tstop.tv_sec = (time_t)excess;
-      excess -= tstop.tv_sec;
-      tstop.tv_nsec = (long)(excess*1e9);
-      nanosleep(&tstop, NULL);
-    }
-    excessive("Frames = %lu = %lf secs, Write Time = %lf\n", frames, sampletime, writetime);
+
+    asrsync_sync(&asrs, frames);
 
     // Make the new HW pointer value visible to the ioplug.
     pcm->io_hw_ptr = io_hw_ptr;
@@ -448,9 +400,11 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
     // to write avail_min frames.  Note that just as we can't read
     // past the end of the hardware buffer the app can't write past
     // it so the metric is distance from the end of the buffer.
-    offset = io_hw_ptr % io->buffer_size;
-    if(io->buffer_size - offset >= pcm->io_avail_min)
+    // offset = io_hw_ptr % io->buffer_size;
+    // if(io->buffer_size - offset >= pcm->io_avail_min) {
+    if (frames + io->buffer_size - avail >= pcm->io_avail_min) {
       eventfd_write(pcm->event_fd, 1);
+    }
   }
 
 fail:
@@ -542,7 +496,7 @@ static int start_camilla(cdsp_t *pcm) {
     }
     fprintf(stderr,"\n");
 #endif
-    
+
     double gain = 0;
     // Use mute < 0 as the flag for gain and mute being set.
     int mute = -1;
@@ -593,7 +547,7 @@ static int start_camilla(cdsp_t *pcm) {
       // Call the config_cmd with the hw params to do whatever
       // camilla configuration is desired
       // Command will be called with arguments "format rate channels"
-      snprintf(command, 1000, "%s %s %d %d\n", pcm->config_cmd, 
+      snprintf(command, 1000, "%s %s %d %d\n", pcm->config_cmd,
           sformat, pcm->io.rate, pcm->io.channels);
       debug("Calling config_cmd %s\n", command);
       int err = system(command);
@@ -718,7 +672,7 @@ static int cdsp_stop(snd_pcm_ioplug_t *io) {
 
 static snd_pcm_sframes_t cdsp_pointer(snd_pcm_ioplug_t *io) {
   cdsp_t *pcm = io->private_data;
-  
+
   // Any error returned here is translated to -EPIPE, SND_PCM_STATE_XRUN,
   // by ioplug; and that prevents snd_pcm_readi() and snd_pcm_writei()
   // from returning -ENODEV to the application on device disconnection.
@@ -779,10 +733,100 @@ static int cdsp_close(snd_pcm_ioplug_t *io) {
   return 0;
 }
 
+#if CDSP_HW_PARAMS_FIX
+/**
+ * Substitute the period and buffer size produced by the ioplug hw param
+ * refinement algorithm with values that do not trigger the rate plugin
+ * avail() implementation bug.
+ *
+ * It is not possible to expand the configuration within a hw_params
+ * container, only to narrow it. By the time we get to see the container
+ * it has already been reduced to a single configuration, so is effectively
+ * read-only. So in order to fix the problematic buffer size calculated by
+ * the ioplug, we need to completely replace the hw_params container for
+ * the bluealsa pcm.
+ * */
+static int cdsp_fix_hw_params(snd_pcm_ioplug_t *io, snd_pcm_hw_params_t *params) {
+// #if DEBUG
+// 	cdsp_t *pcm = io->private_data;
+// #endif
+	int ret = 0;
+
+	snd_pcm_uframes_t period_size;
+	if ((ret = snd_pcm_hw_params_get_period_size(params, &period_size, 0)) < 0)
+		return ret;
+	snd_pcm_uframes_t buffer_size;
+	if ((ret =snd_pcm_hw_params_get_buffer_size(params, &buffer_size)) < 0)
+		return ret;
+
+	if (buffer_size % period_size == 0)
+		return 0;
+
+	debug("Attempting to fix hw params buffer size\n");
+
+	snd_pcm_hw_params_t *refined_params;
+
+	snd_pcm_hw_params_alloca(&refined_params);
+	if ((ret = snd_pcm_hw_params_any(io->pcm, refined_params)) < 0)
+		return ret;
+
+	snd_pcm_access_mask_t *access = alloca(snd_pcm_access_mask_sizeof());
+	if ((ret = snd_pcm_hw_params_get_access_mask(params, access)) < 0)
+		return ret;
+	if ((ret = snd_pcm_hw_params_set_access_mask(io->pcm, refined_params, access)) < 0)
+		return ret;
+
+	snd_pcm_format_t format;
+	if ((ret = snd_pcm_hw_params_get_format(params, &format)) < 0)
+		return ret;
+	if ((ret = snd_pcm_hw_params_set_format(io->pcm, refined_params, format)) < 0)
+		return ret;
+
+	unsigned int channels;
+	if ((ret = snd_pcm_hw_params_get_channels(params, &channels)) < 0)
+		return ret;
+	if ((ret = snd_pcm_hw_params_set_channels(io->pcm, refined_params, channels)) < 0)
+		return ret;
+
+	unsigned int rate;
+	if ((ret = snd_pcm_hw_params_get_rate(params, &rate, 0)) < 0)
+		return ret;
+	if ((ret = snd_pcm_hw_params_set_rate(io->pcm, refined_params, rate, 0)) < 0)
+		return ret;
+
+	if ((ret = snd_pcm_hw_params_set_period_size(io->pcm, refined_params, period_size, 0)) < 0)
+		return ret;
+
+	if ((ret = snd_pcm_hw_params_set_periods_integer(io->pcm, refined_params)) < 0)
+		return ret;
+
+	buffer_size = (buffer_size / period_size) * period_size;
+	if ((ret = snd_pcm_hw_params_set_buffer_size(io->pcm, refined_params, buffer_size)) < 0)
+		return ret;
+
+	snd_pcm_hw_params_copy(params, refined_params);
+
+	return ret;
+}
+#endif
+
 static int cdsp_hw_params(snd_pcm_ioplug_t *io, snd_pcm_hw_params_t *params __attribute__((unused))) {
   cdsp_t *pcm = io->private_data;
   info("Initializing hw_params: %s %d %d\n",
       snd_pcm_format_name(io->format), io->rate, io->channels);
+
+#if	CDSP_HW_PARAMS_FIX
+  if (cdsp_fix_hw_params(io, params) < 0)
+    debug("Warning - unable to fix incorrect buffer size in hw parameters");
+#endif
+
+  snd_pcm_uframes_t period_size;
+  int ret;
+  if ((ret = snd_pcm_hw_params_get_period_size(params, &period_size, 0)) < 0)
+    return ret;
+  snd_pcm_uframes_t buffer_size;
+  if ((ret = snd_pcm_hw_params_get_buffer_size(params, &buffer_size)) < 0)
+    return ret;
 
   pcm->frame_size = (snd_pcm_format_physical_width(io->format)*io->channels)/8;
 
@@ -795,18 +839,20 @@ static int cdsp_hw_params(snd_pcm_ioplug_t *io, snd_pcm_hw_params_t *params __at
   // it is possible to modify the size of this buffer we will set is to some
   // low value, but big enough to prevent audio tearing. Note, that the size
   // will be rounded up to the page size (typically 4096 bytes).
-  pcm->delay_fifo_size = 
+  pcm->delay_fifo_size =
     fcntl(pcm->cdsp_pcm_fd, F_SETPIPE_SZ, 2048) / pcm->frame_size;
 
   info("FIFO buffer size: %ld frames\n", pcm->delay_fifo_size);
 
   /* ALSA default for avail min is one period. */
-  pcm->io_avail_min = io->period_size;
+  // pcm->io_avail_min = io->period_size;
+  pcm->io_avail_min = period_size;
+  info("IO avail min: %ld frames\n", pcm->io_avail_min);
 
   info("Selected HW buffer: %ld periods x %ld bytes %c= %ld bytes\n",
-      io->buffer_size / io->period_size, pcm->frame_size * io->period_size,
-      io->period_size * (io->buffer_size / io->period_size) == io->buffer_size ? '=' : '<',
-      io->buffer_size * pcm->frame_size);
+      buffer_size / period_size, pcm->frame_size * period_size,
+      period_size * (buffer_size / period_size) == buffer_size ? '=' : '<',
+      buffer_size * pcm->frame_size);
 
   return 0;
 }
@@ -817,12 +863,12 @@ static int cdsp_hw_free(snd_pcm_ioplug_t *io) {
   int err = 0;
   if(pcm->camilla_exit_cmd) {
     debug("Calling camilla_exit_cmd: %s\n", pcm->camilla_exit_cmd);
-    // Call the camilla_exit_cmd 
+    // Call the camilla_exit_cmd
     err = system(pcm->camilla_exit_cmd);
     if(err != 0) {
       SNDERR("Error executing camilla_exit_cmd %s\n", pcm->camilla_exit_cmd);
     }
-  } 
+  }
   debug("Stopping Camilla\n");
   if (close_transport(pcm) == -1)
     return -errno;
@@ -850,11 +896,17 @@ static int cdsp_sw_params(snd_pcm_ioplug_t *io, snd_pcm_sw_params_t *params) {
   debug("Initializing SW\n");
 
   snd_pcm_sw_params_get_boundary(params, &pcm->io_hw_boundary);
-  assert(pcm->io_hw_boundary == calc_boundary_size(io));
+  // assert(pcm->io_hw_boundary == calc_boundary_size(io));
 
   // We would get avail_min here but alsa has hidden it from the plugin
   // So we'll just have to ignore the player's request and stick to
   // period_size
+	snd_pcm_uframes_t avail_min;
+	snd_pcm_sw_params_get_avail_min(params, &avail_min);
+	if (avail_min != pcm->io_avail_min) {
+		debug("Changing SW avail min: %zu -> %zu", pcm->io_avail_min, avail_min);
+		pcm->io_avail_min = avail_min;
+	}
 
   return 0;
 }
@@ -863,8 +915,10 @@ static int cdsp_prepare(snd_pcm_ioplug_t *io) {
   cdsp_t *pcm = io->private_data;
 
   // if PCM FIFO is not opened, report it right away
-  if (pcm->cdsp_pcm_fd == -1)
+  if (pcm->cdsp_pcm_fd == -1) {
+    snd_pcm_ioplug_set_state(io, SND_PCM_STATE_DISCONNECTED);
     return -ENODEV;
+  }
 
   // initialize ring buffer and status
   pcm->io_hw_ptr = 0;
@@ -904,7 +958,7 @@ static int cdsp_drain(snd_pcm_ioplug_t *io) {
 //
 // Exact calculation of the PCM delay is very hard, if not impossible. For
 // the sake of simplicity we will make few assumptions and approximations.
-// In general, the delay of this plugin is proportional to the number of 
+// In general, the delay of this plugin is proportional to the number of
 // bytes queued in the FIFO buffer.  Of course CamillaDSP may add consdirable
 // additional delay which is not accounted for in this estimation.
 static snd_pcm_sframes_t cdsp_calculate_delay(snd_pcm_ioplug_t *io) {
@@ -912,19 +966,24 @@ static snd_pcm_sframes_t cdsp_calculate_delay(snd_pcm_ioplug_t *io) {
 
   snd_pcm_sframes_t delay = 0;
 
+
+  /* if PCM is not started there should be no capture delay */
+  if (!pcm->delay_running && io->stream == SND_PCM_STREAM_CAPTURE)
+     return 0;
+
   struct timespec now;
+  gettimestamp(&now);
 
   pthread_mutex_lock(&pcm->mutex);
 
-  gettimestamp(&now);
+
   struct timespec diff;
-  difftimespec(&now, &pcm->delay_ts, &diff);
+  timespecsub(&now, &pcm->delay_ts, &diff);
 
   // the maximum number of frames that can have been
   // produced/consumed by the server since pcm->delay_ts
   unsigned int tframes =
-    //(diff.tv_sec * 1000 + diff.tv_nsec / 1000000) * io->rate / 1000;
-    (unsigned int)(((double)diff.tv_sec + ((double)diff.tv_nsec)/1e9) * io->rate);
+    (diff.tv_sec * 1000 + diff.tv_nsec / 1000000) * io->rate / 1000;
 
   // the number of frames that were in the FIFO at pcm->delay_ts
   snd_pcm_uframes_t fifo_delay = pcm->delay_pcm_nread / pcm->frame_size;
@@ -937,14 +996,29 @@ static snd_pcm_sframes_t cdsp_calculate_delay(snd_pcm_ioplug_t *io) {
   snd_pcm_sframes_t buffer_delay = 0;
   if (io->state != SND_PCM_STATE_XRUN)
     buffer_delay = snd_pcm_ioplug_hw_avail(io, pcm->delay_hw_ptr, io->appl_ptr);
-  delay += buffer_delay;
 
-  if (pcm->delay_running) {
-    // Adjust the total delay by the number of frames consumed.
-    if ((delay -= tframes) < 0) delay = 0;
-  }
+  /* If the PCM is running, then some frames from the buffer may have been
+   * consumed, so we add them before adjusting for time elapsed. */
+  if (pcm->delay_running)
+    delay += buffer_delay;
+
+  /* Adjust the total delay by the number of frames consumed. */
+  if ((delay -= tframes) < 0)
+    delay = 0;
+
+  /* If the PCM is not running, then the frames in the buffer will not have
+   * been consumed since pcm->delay_ts, so we add them after the time
+   * elapsed adjustment. */
+  if (!pcm->delay_running)
+    delay += buffer_delay;
 
   pthread_mutex_unlock(&pcm->mutex);
+
+  /* data transfer (communication) and encoding/decoding */
+  // delay += (io->rate / 100) * pcm->cdsp_pcm.delay / 100;
+
+  //FIX: support
+  // delay += pcm->delay_ex;
 
   return delay;
 }
@@ -955,13 +1029,15 @@ static int cdsp_pause(snd_pcm_ioplug_t *io, int enable) {
   if (enable == 1) {
     // Synchronize the IO thread with an application thread to ensure that
     // the server will not be paused while we are processing a transfer.
+    debug("Pause Sync ON\n");
     pthread_mutex_lock(&pcm->mutex);
     pcm->pause_state |= CDSP_PAUSE_STATE_PENDING;
-    while (!(pcm->pause_state & CDSP_PAUSE_STATE_PAUSED) 
+    while (!(pcm->pause_state & CDSP_PAUSE_STATE_PAUSED)
         && pcm->cdsp_pcm_fd != -1) {
       pthread_cond_wait(&pcm->pause_cond, &pcm->mutex);
     }
     pthread_mutex_unlock(&pcm->mutex);
+    debug("Pause Sync OFF\n");
   }
 
   if (enable == 0) {
@@ -1003,8 +1079,10 @@ static void cdsp_dump(snd_pcm_ioplug_t *io, snd_output_t *out) {
 static int cdsp_delay(snd_pcm_ioplug_t *io, snd_pcm_sframes_t *delayp) {
   cdsp_t *pcm = io->private_data;
 
-  if (pcm->cdsp_pcm_fd == -1)
+  if (pcm->cdsp_pcm_fd == -1) {
+    snd_pcm_ioplug_set_state(io, SND_PCM_STATE_DISCONNECTED);
     return -ENODEV;
+  }
 
   int ret = 0;
   *delayp = 0;
@@ -1025,6 +1103,7 @@ static int cdsp_delay(snd_pcm_ioplug_t *io, snd_pcm_sframes_t *delayp) {
       ret = -ESTRPIPE;
       break;
     case SND_PCM_STATE_DISCONNECTED:
+      snd_pcm_ioplug_set_state(io, SND_PCM_STATE_DISCONNECTED);
       ret = -ENODEV;
       break;
     default:
@@ -1044,9 +1123,9 @@ static int cdsp_poll_revents(snd_pcm_ioplug_t *io, struct pollfd *pfd,
   if (pcm->cdsp_pcm_fd == -1)
     goto fail;
 
-  // We only advertise a single file descriptor so the 
+  // We only advertise a single file descriptor so the
   // player really should be giving us that descriptor
-  // and just that descriptor.  
+  // and just that descriptor.
   assert(nfds == 1);
   assert(pfd[0].fd == pcm->event_fd);
 
@@ -1102,14 +1181,15 @@ static int cdsp_poll_revents(snd_pcm_ioplug_t *io, struct pollfd *pfd,
       case SND_PCM_STATE_SUSPENDED:
         *revents |= POLLERR;
         break;
-      case SND_PCM_STATE_DISCONNECTED:
-        *revents = POLLERR;
-        ret = -ENODEV;
-        break;
       case SND_PCM_STATE_OPEN:
         *revents = POLLERR;
         ret = -EBADF;
         break;
+      case SND_PCM_STATE_DISCONNECTED:
+        // *revents = POLLERR;
+        // ret = -ENODEV;
+        // break;
+        goto fail;
       default:
         break;
     };
@@ -1122,6 +1202,7 @@ static int cdsp_poll_revents(snd_pcm_ioplug_t *io, struct pollfd *pfd,
   return ret;
 
 fail:
+  snd_pcm_ioplug_set_state(io, SND_PCM_STATE_DISCONNECTED);
   *revents = POLLERR | POLLHUP;
   return -ENODEV;
 }
@@ -1298,7 +1379,7 @@ SND_PCM_PLUGIN_DEFINE_FUNC(cdsp) {
       continue;
     }
     if(strcmp(id, "extra_samples_44100") == 0) {
-      if((err = snd_config_get_integer(n, &pcm->ext_samp_44100)) < 0) 
+      if((err = snd_config_get_integer(n, &pcm->ext_samp_44100)) < 0)
         goto _err;
       if(pcm->ext_samp_44100 < 0) {
         SNDERR("extra_samples_44100 must be >= 0");
@@ -1308,7 +1389,7 @@ SND_PCM_PLUGIN_DEFINE_FUNC(cdsp) {
       continue;
     }
     if(strcmp(id, "extra_samples_48000") == 0) {
-      if((err = snd_config_get_integer(n, &pcm->ext_samp_48000)) < 0) 
+      if((err = snd_config_get_integer(n, &pcm->ext_samp_48000)) < 0)
         goto _err;
       if(pcm->ext_samp_48000 < 0) {
         SNDERR("extra_samples_48000 must be >= 0");
@@ -1330,7 +1411,7 @@ SND_PCM_PLUGIN_DEFINE_FUNC(cdsp) {
     err = -EINVAL;
     goto _err;
   }
-  
+
   // Validate user input
   if(!pcm->cpath) {
     SNDERR("Must supply cpath parameter with path to CamillaDSP.");
@@ -1413,23 +1494,23 @@ SND_PCM_PLUGIN_DEFINE_FUNC(cdsp) {
   }
   if(pcm->config_in) {
     if(!pcm->format_token) {
-      if((err = alloc_copy_string(&pcm->format_token, "$format$")) < 0) 
+      if((err = alloc_copy_string(&pcm->format_token, "$format$")) < 0)
         goto _err;
     }
     if(!pcm->rate_token) {
-      if((err = alloc_copy_string(&pcm->rate_token, "$samplerate$")) < 0) 
+      if((err = alloc_copy_string(&pcm->rate_token, "$samplerate$")) < 0)
         goto _err;
     }
     if(!pcm->channels_token) {
-      if((err = alloc_copy_string(&pcm->channels_token, "$channels$")) < 0) 
+      if((err = alloc_copy_string(&pcm->channels_token, "$channels$")) < 0)
         goto _err;
     }
     if(!pcm->ext_samp_token) {
-      if((err = alloc_copy_string(&pcm->ext_samp_token, "$extrasamples$")) < 0) 
+      if((err = alloc_copy_string(&pcm->ext_samp_token, "$extrasamples$")) < 0)
         goto _err;
     }
   }
-    
+
   // Done parsing / validating user input
 
 
@@ -1465,7 +1546,7 @@ SND_PCM_PLUGIN_DEFINE_FUNC(cdsp) {
 #endif
   err = snd_pcm_ioplug_create(&pcm->io, name, stream, mode);
   if(err < 0) goto _err;
-  
+
   // Configure "hw" constraints
   unsigned int format_list[] = {
     SND_PCM_FORMAT_S16_LE,
@@ -1475,21 +1556,21 @@ SND_PCM_PLUGIN_DEFINE_FUNC(cdsp) {
     SND_PCM_FORMAT_FLOAT_LE,
     SND_PCM_FORMAT_FLOAT64_LE
   };
-  if((err = snd_pcm_ioplug_set_param_list(&pcm->io, 
+  if((err = snd_pcm_ioplug_set_param_list(&pcm->io,
       SND_PCM_IOPLUG_HW_FORMAT, 6, format_list)) < 0) goto _err;
 
-  if((err = snd_pcm_ioplug_set_param_minmax(&pcm->io, 
+  if((err = snd_pcm_ioplug_set_param_minmax(&pcm->io,
       SND_PCM_IOPLUG_HW_CHANNELS, min_channels, max_channels)) < 0) goto _err;
 
   if(n_rates > 0) {
-    if((err = snd_pcm_ioplug_set_param_list(&pcm->io, 
+    if((err = snd_pcm_ioplug_set_param_list(&pcm->io,
         SND_PCM_IOPLUG_HW_RATE, n_rates, rate_list)) < 0) goto _err;
   } else {
-    if((err = snd_pcm_ioplug_set_param_minmax(&pcm->io, 
+    if((err = snd_pcm_ioplug_set_param_minmax(&pcm->io,
         SND_PCM_IOPLUG_HW_RATE, min_rate, max_rate)) < 0) goto _err;
   }
 
-  if ((err = snd_pcm_ioplug_set_param_minmax(&pcm->io, 
+  if ((err = snd_pcm_ioplug_set_param_minmax(&pcm->io,
           SND_PCM_IOPLUG_HW_PERIODS, 2, 1024)) < 0)
     goto _err;
 
@@ -1500,26 +1581,26 @@ SND_PCM_PLUGIN_DEFINE_FUNC(cdsp) {
   // limit will not be constrained.
   unsigned int min_p = max_rate / 100 * max_channels * 4 / 8;
 
-  if ((err = snd_pcm_ioplug_set_param_minmax(&pcm->io, 
+  if ((err = snd_pcm_ioplug_set_param_minmax(&pcm->io,
           SND_PCM_IOPLUG_HW_PERIOD_BYTES, min_p, 1024 * 1024)) < 0) goto _err;
 
   unsigned int max_buffer = 2*1024*1024;
   if(max_buffer < 2*min_p) max_buffer = 2*min_p;
-  if((err = snd_pcm_ioplug_set_param_minmax(&pcm->io, 
+  if((err = snd_pcm_ioplug_set_param_minmax(&pcm->io,
           SND_PCM_IOPLUG_HW_BUFFER_BYTES, 2*min_p, max_buffer)) < 0) goto _err;
 
   *pcmp = pcm->io.pcm;
 
   if(pcm->start_cmd) {
     debug("Calling start_cmd: %s\n", pcm->start_cmd);
-    // Call the start_cmd 
+    // Call the start_cmd
     int err = system(pcm->start_cmd);
     if(err != 0) {
       SNDERR("Error executing start_cmd %s\n", pcm->start_cmd);
       if(err > 0) return -err;
       return err;
     }
-  } 
+  }
 
   return 0;
 
@@ -1529,3 +1610,4 @@ _err:
 }
 SND_PCM_PLUGIN_SYMBOL(cdsp)
 
+#include "rt.c"
