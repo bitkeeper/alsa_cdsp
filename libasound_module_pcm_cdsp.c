@@ -32,7 +32,7 @@
 #include "rt.h"
 #include "strrep.h"
 
-#define DEBUG 4
+#define DEBUG 2
 #define error(fmt, ...) \
   do { if(DEBUG > 0){fprintf(stderr,"CDSP Plugin ERROR: ");\
     fprintf(stderr,((fmt)), ##__VA_ARGS__);} } while (0)
