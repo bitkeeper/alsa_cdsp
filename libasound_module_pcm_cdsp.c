@@ -558,22 +558,22 @@ static int start_camilla(cdsp_t *pcm) {
       }
     } else {
       // Pass the hw_params as arguments directly to CamillaDSP
-      char farg[] = "-f";
+      char *farg = "-f";
       pcm->cargs[pcm->n_cargs] = farg;
       pcm->cargs[pcm->n_cargs+1] = sformat;
       extra_cargs += 2;
 
-      char rarg[] = "-r";
+      char *rarg = "-r";
       pcm->cargs[pcm->n_cargs+2] = rarg;
       pcm->cargs[pcm->n_cargs+3] = srate;
       extra_cargs += 2;
 
-      char narg[] = "-n";
+      char *narg = "-n";
       pcm->cargs[pcm->n_cargs+4] = narg;
       pcm->cargs[pcm->n_cargs+5] = schannels;
       extra_cargs += 2;
 
-      char earg[] = "-e";
+      char *earg = "-e";
       if(extrasamples >= 0) {
         pcm->cargs[pcm->n_cargs+6] = earg;
         pcm->cargs[pcm->n_cargs+7] = sextrasamples;
