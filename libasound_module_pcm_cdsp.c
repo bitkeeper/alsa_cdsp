@@ -31,6 +31,7 @@
 
 #include "rt.h"
 #include "strrep.h"
+#include "cdsp_pipe_write.h"
 
 #define DEBUG 2
 #define error(fmt, ...) \
@@ -375,20 +376,19 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
     if ((snd_pcm_uframes_t)io_hw_ptr >= pcm->io_hw_boundary)
       io_hw_ptr -= pcm->io_hw_boundary;
 
-    ssize_t ret = 0;
-
-    // Perform atomic write - see the explanation above.
-    do {
-      if ((ret = write(pcm->cdsp_pcm_fd, head, len)) == -1) {
-        if (errno == EINTR)
-          continue;
-        if (errno != EPIPE)
-          SNDERR("PCM FIFO write error: %s", strerror(errno));
-        goto fail;
-      }
-      head += ret;
-      len -= ret;
-    } while (len != 0);
+    // Perform atomic write - see the explanation above. Keep the whole
+    // frame-aligned period atomic w.r.t. THREAD CANCELLATION as well as partial
+    // write() returns: snd_pcm_drop() -> cdsp_stop() pthread_cancel()s this
+    // thread and write() is a deferred cancellation point, so a cancel arriving
+    // mid-period would leave a sub-frame byte count in the FIFO that the
+    // still-running CamillaDSP reads misaligned -> permanent wideband noise.
+    // cdsp_pipe_write_period() disables cancellation across the write so a drop
+    // can only take effect on a frame boundary (see cdsp_pipe_write.h).
+    if (cdsp_pipe_write_period(pcm->cdsp_pcm_fd, head, len) == -1) {
+      if (errno != EPIPE)
+        SNDERR("PCM FIFO write error: %s", strerror(errno));
+      goto fail;
+    }
     io_thread_update_delay(pcm, io_hw_ptr);
 
     asrsync_sync(&asrs, frames);
