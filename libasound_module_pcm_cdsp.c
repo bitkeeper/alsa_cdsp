@@ -377,7 +377,13 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
 
     ssize_t ret = 0;
 
-    // Perform atomic write - see the explanation above.
+    // Perform atomic write - see the explanation above. The period must also be
+    // atomic w.r.t. cdsp_stop()'s pthread_cancel(): write() is a cancellation
+    // point, and a cancel mid-period would leave a sub-frame byte count in the
+    // FIFO that the still-running CamillaDSP then reads misaligned. A pending
+    // cancel is honoured right after the period, on a frame boundary. The fail
+    // path disables cancellation itself.
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
     do {
       if ((ret = write(pcm->cdsp_pcm_fd, head, len)) == -1) {
         if (errno == EINTR)
@@ -389,6 +395,8 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
       head += ret;
       len -= ret;
     } while (len != 0);
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    pthread_testcancel();
     io_thread_update_delay(pcm, io_hw_ptr);
 
     asrsync_sync(&asrs, frames);
